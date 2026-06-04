@@ -23,11 +23,12 @@ Architecture
               - Forwards to the BYOC provider
               - Streams the SSE response back byte-for-byte
                       │
-                      │  POST <BASE_MODEL_URL | NERVOUS_SYSTEM_URL>
+                      │  POST <BASE_MODEL_URL | NERVOUS_SYSTEM_URL> + /v1/chat/completions
                       ▼
               BYOC Compute Provider    (any OpenAI-compatible endpoint)
               - model="base" (default)  → BASE_MODEL_URL      (base reasoning model)
               - model="nervous_system"  → NERVOUS_SYSTEM_URL  (fast control model)
+              - the proxy appends /v1/chat/completions to the configured base
               - OpenAI-compatible /chat/completions, SSE streaming
 
 Why a proxy layer instead of exposing the provider directly
@@ -95,6 +96,7 @@ Test with curl:
     curl http://localhost:8002/health
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -130,13 +132,16 @@ logger = logging.getLogger("openagent-infra")
 # API_KEY             : Secret validated against the X-API-Key header on /chat.
 #                       The same value openagent-api holds as INFRA_API_KEY.
 #                       Isolated in verify_api_key for a future per-user swap.
-# BASE_MODEL_URL      : OpenAI-compatible chat-completions endpoint for the
-#                       base reasoning model. Default route for all /chat
-#                       requests (model="base" or no model field). Full URL,
-#                       e.g. https://your-provider.com/v1/chat/completions
-# NERVOUS_SYSTEM_URL  : OpenAI-compatible chat-completions endpoint for the
-#                       fast control model. Used when model="nervous_system".
-#                       Optional — when unset, that route is "not configured".
+# BASE_MODEL_URL      : OpenAI-compatible BASE endpoint for the base reasoning
+#                       model — the provider root, WITHOUT the chat-completions
+#                       path. Default route for all /chat requests (model="base"
+#                       or no model field). The proxy appends /v1/chat/completions
+#                       when forwarding, and /health probes this bare base URL
+#                       directly. e.g. https://your-provider.com/openai
+# NERVOUS_SYSTEM_URL  : OpenAI-compatible BASE endpoint for the fast control
+#                       model. Used when model="nervous_system". Same base form
+#                       as BASE_MODEL_URL. Optional — when unset, that route is
+#                       "not configured".
 # PROVIDER_API_KEY    : Sent as Authorization: Bearer on every forwarded
 #                       request to the provider endpoint(s). Never exposed
 #                       to any caller. Required.
@@ -354,10 +359,12 @@ async def proxy_stream(
 
     # Route to the correct provider endpoint based on the model field.
     # Default is always the base model — the pipeline is unbroken for all
-    # callers that do not pass a model field. Each URL is a full
-    # OpenAI-compatible chat-completions endpoint; the proxy POSTs to it
-    # directly without modifying the path.
-    upstream_url = NERVOUS_SYSTEM_URL if model == "nervous_system" else BASE_MODEL_URL
+    # callers that do not pass a model field. Each configured URL is a BASE
+    # endpoint; the proxy appends the OpenAI chat-completions path here when
+    # forwarding. /health probes the bare base URL, so a health check never
+    # touches the inference route (and never wakes a scale-to-zero worker).
+    upstream_base = NERVOUS_SYSTEM_URL if model == "nervous_system" else BASE_MODEL_URL
+    upstream_url  = upstream_base.rstrip("/") + "/v1/chat/completions"
 
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
@@ -398,23 +405,38 @@ async def proxy_stream(
 # ---------------------------------------------------------------------------
 # Provider reachability probe (for /health)
 #
-# Each model endpoint is a POST-only chat-completions URL, so a GET returns
-# a method-not-allowed (or similar 4xx) when the host is alive — which is all
-# we need for a liveness signal. Treat any HTTP response below 500 as
-# "reachable"; treat a connection error, timeout, or 5xx (provider erroring
-# or a serverless worker still spinning up) as "unreachable".
+# Probes the lightweight BASE provider URL — NOT the inference route — so a
+# health check never wakes a scale-to-zero worker and never mistakes a cold
+# model for a dead host. The question is "is the provider HOST reachable?",
+# not "is the model warm?":
+#   - any response below 500                       → reachable
+#   - connection refused / connect-timeout / 5xx   → unreachable
+#   - a slow read (a cold/scale-to-zero worker still spinning up) → STILL
+#     reachable; the host answered the connection, the model is just warming,
+#     and that cold start is absorbed at chat time (where the read timeout is
+#     unbounded). A cold model must report reachable, not unreachable, or the
+#     whole chain (api /health, then the frontend gate) stalls waiting on it.
+# Short, separate connect/read timeouts keep /health fast and non-blocking.
 # ---------------------------------------------------------------------------
 async def probe_endpoint(url: str) -> bool:
-    """Return True if the provider endpoint answers with a status < 500."""
+    """Return True if the provider host is reachable (warm OR cold)."""
     if not url:
         return False
+    timeout = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(
                 url,
                 headers={"Authorization": f"Bearer {PROVIDER_API_KEY}"},
             )
             return resp.status_code < 500
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # The host itself could not be reached.
+        return False
+    except httpx.TimeoutException:
+        # Connected, but slow to respond — a cold worker spinning up. The host
+        # is reachable; the model is just warming.
+        return True
     except Exception:
         return False
 
@@ -488,12 +510,17 @@ async def health():
     Checks that the proxy is running and probes both provider endpoints.
     Returns the status of each.
 
-    status is "ok" when the base model endpoint is reachable; the
+    status is "ok" when the base provider is reachable — including when its
+    model worker is cold/scale-to-zero (a reachable-but-warming provider is
+    "ok", not "unreachable"; the cold start is absorbed at chat time). The
     nervous-system endpoint is checked independently and does not affect the
-    top-level status (it may not be configured yet).
+    top-level status (it may not be configured yet). Both probes run
+    concurrently so /health stays fast.
     """
-    base_model_ok     = await probe_endpoint(BASE_MODEL_URL)
-    nervous_system_ok = await probe_endpoint(NERVOUS_SYSTEM_URL) if NERVOUS_SYSTEM_URL else False
+    base_model_ok, nervous_system_ok = await asyncio.gather(
+        probe_endpoint(BASE_MODEL_URL),
+        probe_endpoint(NERVOUS_SYSTEM_URL),
+    )
 
     status = "ok" if base_model_ok else "degraded"
     return {
