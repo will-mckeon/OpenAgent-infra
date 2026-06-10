@@ -265,7 +265,7 @@ X-API-Key: your_api_key_here
 |---|---|---|---|
 | `input` | string or array of strings | Yes | Text to embed. A list is embedded in a single provider call (batch). Cannot be empty. |
 
-There is no `model` field: the embedding endpoint is selected by URL (`EMBEDDING_MODEL_URL`), the same way `/chat` selects an endpoint by URL rather than a model name in the body. There is no `reasoning_effort` — the embedding model does not reason.
+The caller sends no `model` field — the embedding route is selected by URL (`EMBEDDING_MODEL_URL`), the same way `/chat` selects an endpoint by URL rather than a model name in the body. There is no `reasoning_effort` — the embedding model does not reason. (The proxy itself may add a `model` to the *provider* payload when the server-side `EMBEDDING_MODEL_NAME` is configured — some embedding runtimes require it — but that is `openagent-infra` configuration, not a caller field. See the Environment Variables Reference.)
 
 #### Response
 
@@ -439,6 +439,7 @@ The choice is entirely a caller/frontend decision. `openagent-infra` streams eve
 |---|---|
 | Selector | `model="base"` on `/chat` (default; also the value when `model` is omitted) |
 | Endpoint | `BASE_MODEL_URL` (proxy appends `/v1/chat/completions`) |
+| Model name | `BASE_MODEL_NAME` (optional config) — when set, the proxy adds `"model": <name>` to the forwarded payload; empty by default (the current base worker needs none). |
 | Type | Reasoning model — emits a reasoning chain before the answer |
 | API | OpenAI-compatible (`/chat/completions`, SSE streaming) |
 | Role | Default model — all everyday OpenAgent conversations |
@@ -449,6 +450,7 @@ The choice is entirely a caller/frontend decision. `openagent-infra` streams eve
 |---|---|
 | Selector | `model="nervous_system"` on `/chat` |
 | Endpoint | `NERVOUS_SYSTEM_URL` (optional — when unset, the route is "not configured"; proxy appends `/v1/chat/completions`) |
+| Model name | `NERVOUS_SYSTEM_MODEL_NAME` (optional config) — when set, the proxy adds `"model": <name>` to the forwarded payload; empty by default. |
 | Type | Reasoning model — emits a reasoning chain before the answer |
 | API | OpenAI-compatible (`/chat/completions`, SSE streaming) |
 | Role | Fast control layer — routing, history filtering, agent decisions |
@@ -457,8 +459,9 @@ The choice is entirely a caller/frontend decision. `openagent-infra` streams eve
 
 | Property | Value |
 |---|---|
-| Selector | `POST /embed` (no `model` field — selected by URL) |
+| Selector | `POST /embed` (caller sends no `model` field — route selected by URL) |
 | Endpoint | `EMBEDDING_MODEL_URL` (optional — when unset, `/embed` returns "not configured"; proxy appends `/v1/embeddings`) |
+| Model name | `EMBEDDING_MODEL_NAME` (optional config) — when set, the proxy adds `"model": <name>` to the forwarded payload. Required by some runtimes (e.g. BGE-M3 returns 500 without it; set `BAAI/bge-m3`). |
 | Type | Embedding model — turns text into vectors. Not a reasoning model; no reasoning chain. |
 | API | OpenAI-compatible (`/v1/embeddings`, single JSON response) |
 | Role | Text → vector for retrieval (e.g. conversation-history search) |
@@ -596,6 +599,9 @@ A `401` indicates a key configuration error between the caller and `openagent-in
 | `EMBEDDING_MODEL_URL` | string | — | OpenAI-compatible **base** endpoint for the embedding model. Same base form; proxy appends `/v1/embeddings`. Used by `POST /embed`. Optional — when unset, `/embed` returns "not configured" and `/chat` is unaffected. |
 | `PROVIDER_API_KEY` | string | — | Bearer credential for the BYOC provider endpoint(s). Never exposed to callers. Required. |
 | `REASONING_EFFORT` | string | `medium` | Server default reasoning level for the chat models. Overridable per `/chat` request. |
+| `BASE_MODEL_NAME` | string | `""` | Optional. When set, the proxy adds `"model": <name>` to the forwarded payload for `model="base"` `/chat` requests; when empty, no model field is sent. Set only if the base endpoint requires an explicit model field. |
+| `NERVOUS_SYSTEM_MODEL_NAME` | string | `""` | Optional. Same as `BASE_MODEL_NAME`, for `model="nervous_system"` `/chat` requests. |
+| `EMBEDDING_MODEL_NAME` | string | `""` | Optional. When set, the proxy adds `"model": <name>` to the `/embed` payload; when empty, no model field is sent. Required by embedding runtimes that demand a model field — e.g. BGE-M3 returns `500` without it (set `BAAI/bge-m3`). |
 
 ---
 
@@ -615,7 +621,7 @@ A `401` indicates a key configuration error between the caller and `openagent-in
 | `400` empty input (`/embed`) | `input` is an empty string or empty list | Send non-empty text |
 | `503` on `/embed` — "not configured" | `EMBEDDING_MODEL_URL` not set in `.env` | Set the embedding endpoint URL once the model is deployed |
 | `503` on `/embed` — "not reachable" | Embedding provider host unreachable | Check the provider's console for endpoint/worker status |
-| `502` on `/embed` | Embedding provider returned a non-200, or a proxy-level error | Inspect the operator logs for the upstream status |
+| `502` on `/embed` | Embedding provider returned a non-200, or a proxy-level error. A common cause is a runtime that requires a `model` field and returns `500` without it (BGE-M3 does). | Inspect the operator logs for the upstream status. If the upstream is `500`, set `EMBEDDING_MODEL_NAME` (e.g. `BAAI/bge-m3`) so the proxy includes a model name. |
 | `nervous_system` routes to the control model | `model="nervous_system"` field set | Confirm `NERVOUS_SYSTEM_URL` is set in `.env` |
 | `nervous_system` / `embedding` shows "not configured" on `/health` | The corresponding URL not set in `.env` | Add the endpoint URL once that model is deployed |
 | Reasoning-format delimiters occasionally in the `/chat` stream | Some provider serving runtimes don't fully parse the model's reasoning format | `openagent-infra` forwards bytes unchanged; the caller's display policy handles it. Resolves when the provider's runtime supports the model's reasoning parser. |

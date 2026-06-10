@@ -50,6 +50,10 @@ Architecture
               - the proxy appends the OpenAI path to the configured BASE url
               - chat : /v1/chat/completions, SSE streaming
               - embed: /v1/embeddings, single JSON response
+              - an optional per-route model name (BASE_MODEL_NAME,
+                NERVOUS_SYSTEM_MODEL_NAME, EMBEDDING_MODEL_NAME) is added to the
+                forwarded payload only when set — required by some providers
+                (e.g. a BGE-M3 embedding server), omitted otherwise
 
 Why a proxy layer instead of exposing the provider directly
 ---------------------------------------
@@ -192,9 +196,28 @@ logger = logging.getLogger("openagent-infra")
 #                       Applies to both chat models (the embedding model does
 #                       not reason). low | medium (default) | high.
 #
-# No model name is sent in the payload — each provider endpoint serves a fixed
-# model. The proxy routes by URL selection, not by a model name in the body.
-# This holds for /chat (base vs nervous-system) and /embed alike.
+# BASE_MODEL_NAME           : Optional model name for the base route. When set,
+#                             the proxy adds "model": <name> to the payload it
+#                             forwards for model="base" /chat requests. When
+#                             empty, no model field is sent (original behavior).
+# NERVOUS_SYSTEM_MODEL_NAME : Optional model name for the nervous-system route.
+#                             Same behavior, for model="nervous_system" /chat
+#                             requests.
+# EMBEDDING_MODEL_NAME      : Optional model name for the embedding route. When
+#                             set, the proxy adds "model": <name> to the /embed
+#                             payload. Some embedding runtimes (e.g. a BGE-M3
+#                             server) REQUIRE this field and return 500 without
+#                             it; set it to the served model id, e.g. BAAI/bge-m3.
+#
+# Model name is OPTIONAL PER ROUTE. Routing is still by URL selection — the
+# *_MODEL_NAME vars do not change which endpoint a request goes to. They only
+# control whether a "model" field is included in the forwarded payload:
+#   - var set   -> the proxy adds "model": <name> to that route's payload
+#   - var empty -> the proxy omits "model" entirely (the original behavior)
+# This keeps providers whose endpoint serves a fixed model working untouched
+# (leave the var empty), while satisfying providers that require an explicit
+# model field (set it). It holds independently for /chat (base, nervous-system)
+# and /embed.
 # ---------------------------------------------------------------------------
 API_KEY             = os.environ.get("API_KEY", "")
 BASE_MODEL_URL      = os.environ.get("BASE_MODEL_URL", "")
@@ -202,6 +225,12 @@ NERVOUS_SYSTEM_URL  = os.environ.get("NERVOUS_SYSTEM_URL", "")
 EMBEDDING_MODEL_URL = os.environ.get("EMBEDDING_MODEL_URL", "")
 PROVIDER_API_KEY    = os.environ.get("PROVIDER_API_KEY", "")
 REASONING_EFFORT    = os.environ.get("REASONING_EFFORT", "medium")
+
+# Optional per-route model names (see note above). Empty by default — when set,
+# the proxy includes "model": <name> in that route's forwarded payload.
+BASE_MODEL_NAME           = os.environ.get("BASE_MODEL_NAME", "")
+NERVOUS_SYSTEM_MODEL_NAME = os.environ.get("NERVOUS_SYSTEM_MODEL_NAME", "")
+EMBEDDING_MODEL_NAME      = os.environ.get("EMBEDDING_MODEL_NAME", "")
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +279,9 @@ async def lifespan(app: FastAPI):
     logger.info("Base model endpoint   : %s", BASE_MODEL_URL or "NOT SET")
     logger.info("Nervous system URL    : %s", NERVOUS_SYSTEM_URL or "NOT SET")
     logger.info("Embedding model URL   : %s", EMBEDDING_MODEL_URL or "NOT SET")
+    logger.info("Base model name       : %s", BASE_MODEL_NAME or "(not sent)")
+    logger.info("Nervous system name   : %s", NERVOUS_SYSTEM_MODEL_NAME or "(not sent)")
+    logger.info("Embedding model name  : %s", EMBEDDING_MODEL_NAME or "(not sent)")
     logger.info("Default reasoning     : %s", REASONING_EFFORT)
     logger.info("Provider API key      : ...%s", PROVIDER_API_KEY[-4:] if PROVIDER_API_KEY else "NOT SET")
     logger.info("=== OpenAgent Inference API Ready — listening on :8002 ===")
@@ -335,9 +367,12 @@ class EmbedRequest(BaseModel):
             when embedding several items at once (e.g. multiple conversation
             chunks at write time), since it avoids one round-trip per item.
 
-            There is no `model` field: the embedding endpoint is selected by
-            URL (EMBEDDING_MODEL_URL), the same way /chat selects an endpoint
-            by URL rather than by a model name in the body.
+            The caller sends no `model` field — the embedding route is
+            selected by URL (EMBEDDING_MODEL_URL), the same way /chat selects an
+            endpoint by URL rather than by a model name in the body. The proxy
+            itself adds a "model" to the *provider* payload when the server-side
+            EMBEDDING_MODEL_NAME is set (some embedding runtimes require it);
+            that is configuration, not a caller field.
 
     Example — single string:
         { "input": "the quick brown fox" }
@@ -433,8 +468,24 @@ async def proxy_stream(
     # endpoint; the proxy appends the OpenAI chat-completions path here when
     # forwarding. /health probes the bare base URL, so a health check never
     # touches the inference route (and never wakes a scale-to-zero worker).
-    upstream_base = NERVOUS_SYSTEM_URL if model == "nervous_system" else BASE_MODEL_URL
-    upstream_url  = upstream_base.rstrip("/") + "/v1/chat/completions"
+    #
+    # The matching per-route model name (BASE_MODEL_NAME / NERVOUS_SYSTEM_MODEL_NAME)
+    # is selected alongside the URL. Routing is by URL; the name only decides
+    # whether a "model" field rides along in the payload (see below).
+    if model == "nervous_system":
+        upstream_base = NERVOUS_SYSTEM_URL
+        model_name    = NERVOUS_SYSTEM_MODEL_NAME
+    else:
+        upstream_base = BASE_MODEL_URL
+        model_name    = BASE_MODEL_NAME
+
+    upstream_url = upstream_base.rstrip("/") + "/v1/chat/completions"
+
+    # Include "model" only when this route's name is configured. When empty,
+    # the field is omitted — the original behavior, preserved for providers
+    # whose endpoint serves a fixed model and needs no model field.
+    if model_name:
+        payload["model"] = model_name
 
     try:
         async with httpx.AsyncClient(timeout=600.0) as client:
@@ -484,6 +535,11 @@ async def proxy_stream(
 # The configured EMBEDDING_MODEL_URL is a BASE endpoint (same convention as
 # BASE_MODEL_URL / NERVOUS_SYSTEM_URL); the proxy appends /v1/embeddings here.
 #
+# Model name: when EMBEDDING_MODEL_NAME is set, the proxy adds "model": <name>
+# to the forwarded payload. Some embedding runtimes (e.g. a BGE-M3 server)
+# require this field and return 500 without it; others ignore it. When the var
+# is empty, no model field is sent (the original behavior).
+#
 # Timeout matches /chat (generous, not short) on purpose: a scale-to-zero
 # embedding worker still cold-starts on its first call after an idle period,
 # even though a warm embed returns in milliseconds. A short read timeout would
@@ -509,6 +565,12 @@ async def proxy_embed(inputs: Union[str, List[str]]) -> httpx.Response:
     upstream_url = EMBEDDING_MODEL_URL.rstrip("/") + "/v1/embeddings"
 
     payload = {"input": inputs}
+
+    # Include "model" only when EMBEDDING_MODEL_NAME is configured. Required by
+    # some embedding runtimes (e.g. BGE-M3, which returns 500 without it);
+    # omitted when empty, preserving the original no-model-field behavior.
+    if EMBEDDING_MODEL_NAME:
+        payload["model"] = EMBEDDING_MODEL_NAME
 
     async with httpx.AsyncClient(timeout=600.0) as client:
         return await client.post(

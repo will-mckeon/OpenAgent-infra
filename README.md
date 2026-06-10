@@ -192,9 +192,15 @@ NERVOUS_SYSTEM_URL=https://your-provider.com/openai
 EMBEDDING_MODEL_URL=https://your-provider.com/openai
 PROVIDER_API_KEY=your_provider_api_key_here
 REASONING_EFFORT=medium
+# Optional per-route model names — sent in the forwarded payload only when set.
+BASE_MODEL_NAME=
+NERVOUS_SYSTEM_MODEL_NAME=
+EMBEDDING_MODEL_NAME=
 ```
 
 `NERVOUS_SYSTEM_URL` and `EMBEDDING_MODEL_URL` are optional — if unset, those routes report "not configured" and the base `/chat` path is unaffected.
+
+The `*_MODEL_NAME` vars are optional and empty by default. When set, the proxy adds `"model": <name>` to that route's forwarded payload; when empty, no model field is sent (the original behavior). Routing is always by URL — the names only shape the payload. Set one **only if your endpoint requires an explicit model field**: notably, many embedding runtimes do — BGE-M3 returns `500` without it, so set `EMBEDDING_MODEL_NAME=BAAI/bge-m3` for the embedding route.
 
 Generate a secure `API_KEY` with:
 ```bash
@@ -296,7 +302,7 @@ X-API-Key: your_api_key_here
 |---|---|---|---|
 | `input` | string or array of strings | Yes | Text to embed. A list is embedded in one provider call (batch). Cannot be empty. |
 
-There is no `model` field (the endpoint is selected by `EMBEDDING_MODEL_URL`) and no `reasoning_effort` (the embedding model does not reason).
+The caller sends no `model` field (the route is selected by `EMBEDDING_MODEL_URL`) and no `reasoning_effort` (the embedding model does not reason). The proxy itself adds a `"model"` to the provider payload when the server-side `EMBEDDING_MODEL_NAME` is set — required by runtimes like BGE-M3 — but that is configuration, not a caller field.
 
 **Response:** the provider's embeddings JSON, passed through unchanged:
 ```json
@@ -372,6 +378,9 @@ http://localhost:8002/docs
 | `EMBEDDING_MODEL_URL` | — | **Base** endpoint for the embedding model (no path; proxy appends `/v1/embeddings`). Used by `POST /embed`. Optional |
 | `PROVIDER_API_KEY` | — | API key for Bearer auth on all compute endpoints (required) |
 | `REASONING_EFFORT` | `medium` | Default reasoning level for the chat models — `low`, `medium`, or `high` |
+| `BASE_MODEL_NAME` | `""` | Optional. When set, the proxy adds `"model": <name>` to the `model="base"` `/chat` payload; empty by default |
+| `NERVOUS_SYSTEM_MODEL_NAME` | `""` | Optional. Same as `BASE_MODEL_NAME`, for `model="nervous_system"` `/chat` requests |
+| `EMBEDDING_MODEL_NAME` | `""` | Optional. When set, the proxy adds `"model": <name>` to the `/embed` payload. Required by runtimes that demand it — BGE-M3 returns `500` without it (set `BAAI/bge-m3`) |
 
 ---
 

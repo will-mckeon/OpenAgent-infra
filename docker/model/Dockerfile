@@ -22,8 +22,10 @@
 #    docker-compose.yml — this container has no GPU dependency.
 #
 # 5. All secrets (API_KEY, PROVIDER_API_KEY) and tuneable values
-#    (BASE_MODEL_URL, NERVOUS_SYSTEM_URL, EMBEDDING_MODEL_URL, REASONING_EFFORT)
-#    are passed via the root .env file — never hardcoded here.
+#    (BASE_MODEL_URL, NERVOUS_SYSTEM_URL, EMBEDDING_MODEL_URL, REASONING_EFFORT,
+#    and the optional BASE_MODEL_NAME / NERVOUS_SYSTEM_MODEL_NAME /
+#    EMBEDDING_MODEL_NAME) are passed via the root .env file — never hardcoded
+#    here.
 #
 # 6. This Dockerfile serves one service in docker-compose.yml:
 #      openagent-infra — runs the FastAPI proxy on port 8002.
@@ -129,13 +131,24 @@ ENV PYTHONUNBUFFERED=1 \
 #   Default reasoning effort applied to both chat models if not set per request
 #   (the embedding model does not reason).
 #   low | medium (default) | high. Overridable per request.
+#
+# BASE_MODEL_NAME / NERVOUS_SYSTEM_MODEL_NAME / EMBEDDING_MODEL_NAME
+#   Optional model name per route. When set, the proxy adds "model": <name> to
+#   that route's forwarded payload; when empty, no model field is sent (the
+#   default). Required by providers that demand an explicit model field — e.g.
+#   a BGE-M3 embedding worker returns 500 without it (set EMBEDDING_MODEL_NAME=
+#   BAAI/bge-m3). Routing is by URL regardless; these only shape the payload.
+#   All empty by default; real values come from .env.
 # -----------------------------------------------------------------------------
 ENV API_KEY="" \
     BASE_MODEL_URL="" \
     NERVOUS_SYSTEM_URL="" \
     EMBEDDING_MODEL_URL="" \
     PROVIDER_API_KEY="" \
-    REASONING_EFFORT="medium"
+    REASONING_EFFORT="medium" \
+    BASE_MODEL_NAME="" \
+    NERVOUS_SYSTEM_MODEL_NAME="" \
+    EMBEDDING_MODEL_NAME=""
 
 
 # -----------------------------------------------------------------------------
